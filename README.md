@@ -4,7 +4,7 @@ A fast V8 bytecode decompiler written in Rust. Parses the text output of `--prin
 
 ## Why Rust?
 
-The original [view8](https://github.com/nicowillis/view8) Python tool works well but struggles with large V8 dump files. For a file with ~308K bytecode lines:
+The original [View8](https://github.com/suleram/View8) Python tool works well but struggles with large V8 dump files. For a file with ~308K bytecode lines:
 
 | Tool | Peak RAM |
 |------|----------|
