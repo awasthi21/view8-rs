@@ -1,13 +1,18 @@
 [package]
 name = "view8_rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "V8 bytecode decompiler in Rust. Handles 308K-line functions in ~1GB RAM (vs 900GB in Python)."
+description = "V8 bytecode decompiler in Rust. Handles 308K-function dumps in ~30MB RAM (vs ~900GB Python)."
+license = "MIT"
+repository = "https://github.com/awasthi21/view8-rs"
+keywords = ["v8", "bytecode", "decompiler", "reverse-engineering", "javascript"]
+categories = ["command-line-utilities", "development-tools::debugging"]
 
 [dependencies]
 regex = "1"
 lazy_static = "1.4"
 memmap2 = "0.9"
+rayon = "1"
 
 [profile.release]
 opt-level = 3
