@@ -1,0 +1,15 @@
+[package]
+name = "view8_rs"
+version = "0.1.0"
+edition = "2021"
+description = "V8 bytecode decompiler in Rust. Handles 308K-line functions in ~1GB RAM (vs 900GB in Python)."
+
+[dependencies]
+regex = "1"
+lazy_static = "1.4"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
