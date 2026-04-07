@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::process::Command;
 use std::time::Instant;
 
 // =============================================================================
@@ -12,9 +13,94 @@ use std::time::Instant;
 //   Rust view8-rs: ~30MB (flat structs, no GC, no overhead)
 // =============================================================================
 
+#[derive(Clone, PartialEq)]
+enum ExportFormat { V8Opcode, Translated, Decompiled }
+
+struct Config {
+    input: String,
+    output: String,
+    disassembler: Option<String>,
+    formats: Vec<ExportFormat>,
+}
+
+impl Config {
+    fn parse() -> Result<Self, String> {
+        let args: Vec<String> = env::args().collect();
+        let mut input = None;
+        let mut output = None;
+        let mut disassembler = None;
+        let mut formats = Vec::new();
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-p" | "--path" => {
+                    i += 1;
+                    disassembler = Some(args.get(i).cloned().ok_or("--path requires a value")?);
+                }
+                "-e" | "--export-format" => {
+                    i += 1;
+                    while i < args.len() && !args[i].starts_with('-') {
+                        formats.push(match args[i].as_str() {
+                            "v8_opcode"  => ExportFormat::V8Opcode,
+                            "translated" => ExportFormat::Translated,
+                            "decompiled" => ExportFormat::Decompiled,
+                            other => return Err(format!("Unknown format '{}'. Valid: v8_opcode, translated, decompiled", other)),
+                        });
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ if !args[i].starts_with('-') => {
+                    if input.is_none() { input = Some(args[i].clone()); }
+                    else if output.is_none() { output = Some(args[i].clone()); }
+                    else { return Err(format!("Unexpected argument: {}", args[i])); }
+                }
+                other => return Err(format!("Unknown option: {}", other)),
+            }
+            i += 1;
+        }
+        if formats.is_empty() { formats.push(ExportFormat::Decompiled); }
+        Ok(Config {
+            input:  input.ok_or("Missing input file")?,
+            output: output.ok_or("Missing output file")?,
+            disassembler,
+            formats,
+        })
+    }
+
+    fn print_usage() {
+        eprintln!("view8_rs — V8 bytecode decompiler (Rust)");
+        eprintln!("Usage: view8_rs [options] <input> <output>");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  -p, --path <binary>           Path to disassembler binary (e.g. d8)");
+        eprintln!("                                 If omitted, input must be pre-disassembled text");
+        eprintln!("  -e, --export-format <fmt...>  Output format(s) (default: decompiled)");
+        eprintln!("                                   v8_opcode   raw V8 opcode + operands");
+        eprintln!("                                   translated  accumulator-model pseudo-JS");
+        eprintln!("                                   decompiled  resolved constants (default)");
+        eprintln!("                                 Multiple formats are written as columns:");
+        eprintln!("                                   -e v8_opcode translated decompiled");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  # pre-disassembled input (node --print-bytecode output)");
+        eprintln!("  view8_rs bytecode.txt out.js");
+        eprintln!();
+        eprintln!("  # raw .jsc file via disassembler binary");
+        eprintln!("  view8_rs -p ./d8 input.jsc out.js");
+        eprintln!();
+        eprintln!("  # multiple export formats side by side");
+        eprintln!("  view8_rs -e v8_opcode decompiled bytecode.txt out.js");
+        eprintln!();
+        eprintln!("  # all three formats");
+        eprintln!("  view8_rs -e v8_opcode translated decompiled bytecode.txt out.js");
+        eprintln!();
+        eprintln!("308K-function files: ~30MB RAM (vs ~900GB Python)");
+    }
+}
+
 struct CodeLine {
     offset: u32,
-    opcode: String,
     instruction: String,
     translated: String,
     decompiled: String,
@@ -63,6 +149,10 @@ struct Parser {
 }
 
 impl Parser {
+    fn from_lines(lines: Vec<String>) -> Self {
+        Self { lines, pos: 0, fixed_arrays: HashMap::new() }
+    }
+
     fn new(path: &str) -> io::Result<Self> {
         let t = Instant::now();
         let f = File::open(path)?;
@@ -70,7 +160,26 @@ impl Parser {
         let lines: Vec<String> = r.lines().filter_map(|l| l.ok()).collect();
         eprintln!("Read {} lines in {:.1}s ({:.0}MB)", lines.len(), t.elapsed().as_secs_f32(),
             lines.iter().map(|l| l.len()).sum::<usize>() as f64 / 1e6);
-        Ok(Self { lines, pos: 0, fixed_arrays: HashMap::new() })
+        Ok(Self::from_lines(lines))
+    }
+
+    fn from_disassembler(binary: &str, input: &str) -> io::Result<Self> {
+        let t = Instant::now();
+        eprintln!("Running disassembler: {} {}", binary, input);
+        let out = Command::new(binary)
+            .arg(input)
+            .output()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other,
+                format!("Failed to run '{}': {}", binary, e)))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::new(io::ErrorKind::Other,
+                format!("Disassembler failed ({}): {}", out.status, stderr.trim())));
+        }
+        let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines().map(|l| l.to_string()).collect();
+        eprintln!("Disassembled {} lines in {:.1}s", lines.len(), t.elapsed().as_secs_f32());
+        Ok(Self::from_lines(lines))
     }
 
     fn next(&mut self) -> Option<&str> {
@@ -235,9 +344,9 @@ impl Parser {
 fn parse_bc_line(line: &str) -> Option<CodeLine> {
     let c = BYTECODE_RE.captures(line)?;
     let offset = c[1].parse().ok()?;
-    let op = c[2].to_string();
+    let op = &c[2];
     let rest = c.get(3).map(|m| m.as_str().trim()).unwrap_or("");
-    Some(CodeLine { offset, opcode: op.clone(), instruction: format!("{} {}", op, rest),
+    Some(CodeLine { offset, instruction: format!("{} {}", op, rest).trim_end().to_string(),
         translated: String::new(), decompiled: String::new(), visible: true })
 }
 
@@ -326,7 +435,7 @@ fn translate(sfi: &mut SharedFunctionInfo) {
             "JumpIfNull" => format!("if (ACCU === null) goto {}", a(0)),
             "JumpIfUndefined" => format!("if (ACCU === undefined) goto {}", a(0)),
             "JumpIfUndefinedOrNull" => format!("if (ACCU == null) goto {}", a(0)),
-            "SwitchOnSmiNoFeedback" => format!("switch (ACCU)"),
+            "SwitchOnSmiNoFeedback" => "switch (ACCU)".into(),
             "PushContext" => format!("{} = PushContext(ACCU)", a(0)),
             "PopContext" => format!("PopContext({})", a(0)),
             "SuspendGenerator" => format!("yield {}", a(0)),
@@ -357,34 +466,43 @@ fn replace_const_pool(sfi: &mut SharedFunctionInfo) {
     }
 }
 
-fn export(w: &mut BufWriter<File>, sfi: &SharedFunctionInfo) -> io::Result<()> {
+fn export(w: &mut BufWriter<File>, sfi: &SharedFunctionInfo, formats: &[ExportFormat]) -> io::Result<()> {
     writeln!(w, "{}", sfi.header())?;
     writeln!(w, "{{")?;
     for l in &sfi.code {
-        if !l.visible || l.decompiled.is_empty() { continue; }
-        writeln!(w, "\t{}", l.decompiled)?;
+        if !l.visible { continue; }
+        let cols: Vec<&str> = formats.iter().filter_map(|fmt| match fmt {
+            ExportFormat::V8Opcode   => Some(l.instruction.as_str()).filter(|s| !s.is_empty()),
+            ExportFormat::Translated => Some(l.translated.as_str()).filter(|s| !s.is_empty()),
+            ExportFormat::Decompiled => Some(l.decompiled.as_str()).filter(|s| !s.is_empty()),
+        }).collect();
+        if !cols.is_empty() {
+            writeln!(w, "\t{}", cols.join("  |  "))?;
+        }
     }
     writeln!(w, "}}")
 }
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("view8_rs — V8 bytecode decompiler (Rust)");
-        eprintln!("Usage: view8_rs <input.txt> <output.js>");
-        eprintln!("\n308K-line functions: ~30MB RAM (vs ~900GB Python)");
+    let cfg = Config::parse().unwrap_or_else(|e| {
+        eprintln!("Error: {}\n", e);
+        Config::print_usage();
         std::process::exit(1);
-    }
+    });
 
     let t = Instant::now();
-    let mut parser = Parser::new(&args[1])?;
+    let mut parser = match &cfg.disassembler {
+        Some(bin) => Parser::from_disassembler(bin, &cfg.input)?,
+        None      => Parser::new(&cfg.input)?,
+    };
+
     let mut funcs = parser.parse_all();
     drop(parser); // free all parsed lines
 
     let total = funcs.len();
     eprintln!("Decompiling {} functions...", total);
 
-    let f = File::create(&args[2])?;
+    let f = File::create(&cfg.output)?;
     let mut w = BufWriter::with_capacity(256 * 1024, f);
 
     for (i, mut sfi) in funcs.drain(..).enumerate() {
@@ -393,11 +511,11 @@ fn main() -> io::Result<()> {
         }
         translate(&mut sfi);
         replace_const_pool(&mut sfi);
-        export(&mut w, &sfi)?;
+        export(&mut w, &sfi, &cfg.formats)?;
         // sfi DROPPED here — memory freed instantly, no GC
     }
 
     w.flush()?;
-    eprintln!("Done. {} functions in {:.1}s → {}", total, t.elapsed().as_secs_f32(), &args[2]);
+    eprintln!("Done. {} functions in {:.1}s → {}", total, t.elapsed().as_secs_f32(), &cfg.output);
     Ok(())
 }
